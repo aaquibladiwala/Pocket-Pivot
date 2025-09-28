@@ -1,21 +1,35 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import sqlite3
 from tqdm import tqdm
 import logging
 from tabulate import tabulate
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
+from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 
 # Set up logging for errors
 logging.basicConfig(filename='errors.log', level=logging.WARNING, 
                     format='%(asctime)s - %(message)s')
 
+# SQLite database setup
+DB_NAME = "stock_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS stock_data
+                 (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+                  PRIMARY KEY (symbol, date))''')
+    conn.commit()
+    conn.close()
+
 @st.cache_data
 def fetch_nse_symbols(max_symbols=None):
     try:
-        df = pd.read_csv('https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/refs/heads/main/EQUITY_L.csv')
+        df = pd.read_csv('https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv')
         symbols = df['SYMBOL'].tolist()
         if max_symbols:
             symbols = symbols[:max_symbols]
@@ -25,6 +39,55 @@ def fetch_nse_symbols(max_symbols=None):
         logging.warning(f"Error reading EQUITY_L.csv: {e}")
         st.error(f"Error reading EQUITY_L.csv: {e}. Using sample list.")
         return ['RELIANCE', 'INFY', 'TCS', 'HDFCBANK', 'ICICIBANK']
+
+def fetch_cached_data(symbol, days_back):
+    conn = sqlite3.connect(DB_NAME)
+    query = f"SELECT * FROM stock_data WHERE symbol = ? AND date >= ?"
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back)
+    df = pd.read_sql_query(query, conn, params=(symbol, start_date.strftime('%Y-%m-%d')))
+    conn.close()
+    
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df = df[['open', 'high', 'low', 'close', 'volume']]
+        df.columns = [col.capitalize() for col in df.columns]
+        df['Symbol'] = symbol
+    return df
+
+def save_to_cache(symbol, data):
+    if data is None or data.empty:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    data = data.reset_index()
+    data['symbol'] = symbol
+    data = data[['symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    data.columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']
+    data['date'] = data['date'].astype(str)
+    data.to_sql('stock_data', conn, if_exists='append', index=False, method='multi')
+    conn.execute("DELETE FROM stock_data WHERE rowid NOT IN (SELECT MIN(rowid) FROM stock_data GROUP BY symbol, date)")
+    conn.commit()
+    conn.close()
+
+def fetch_stock_data(symbol, days_back):
+    try:
+        # Check cache first
+        cached_data = fetch_cached_data(symbol, days_back)
+        latest_date = cached_data.index.max() if not cached_data.empty else None
+        end_date = datetime.now()
+        needs_update = not cached_data.empty and latest_date < end_date - timedelta(days=1)
+        
+        if cached_data.empty or needs_update:
+            ticker = yf.Ticker(symbol + '.NS')
+            data = ticker.history(period=f"{days_back}d")
+            if not data.empty:
+                save_to_cache(symbol, data)
+                return symbol, data
+        return symbol, cached_data
+    except Exception as e:
+        logging.warning(f"Error fetching data for {symbol}: {e}")
+        return symbol, None
 
 def detect_pocket_pivot(df, symbol, lookback=10, sma_period=50, max_distance_52w_high=0.05, 
                         tightness_percentage=5.0, min_volume=10000, price_above_low_multiplier=1.10,
@@ -92,15 +155,6 @@ def detect_pocket_pivot(df, symbol, lookback=10, sma_period=50, max_distance_52w
         logging.warning(f"Error processing {symbol}: {e}")
         return None
 
-def fetch_stock_data(symbol, days_back):
-    try:
-        ticker = yf.Ticker(symbol + '.NS')
-        data = ticker.history(period=f"{days_back}d")
-        return symbol, data
-    except Exception as e:
-        logging.warning(f"Error fetching data for {symbol}: {e}")
-        return symbol, None
-
 def fetch_market_cap(symbol):
     try:
         ticker = yf.Ticker(symbol + '.NS')
@@ -135,6 +189,7 @@ def screen_stocks(symbols, days_back=365, lookback=10, sma_period=50, max_distan
                     if (symbol + '.NS') in data:
                         stock_data = data[symbol + '.NS'].dropna()
                         stock_data['Symbol'] = symbol
+                        save_to_cache(symbol, stock_data)  # Cache batched data
                         futures.append(executor.submit(detect_pocket_pivot, stock_data, symbol, 
                                                     lookback, sma_period, max_distance_52w_high, 
                                                     tightness_percentage, min_volume, price_above_low_multiplier,
@@ -143,7 +198,7 @@ def screen_stocks(symbols, days_back=365, lookback=10, sma_period=50, max_distan
                 except Exception as e:
                     logging.warning(f"Error accessing batch data for {symbol}: {e}")
         else:
-            # Fallback to individual fetches
+            # Fallback to individual fetches with caching
             futures = [executor.submit(fetch_stock_data, symbol, days_back) for symbol in symbols]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching stocks"):
                 symbol, stock_data = future.result()
@@ -173,12 +228,15 @@ def screen_stocks(symbols, days_back=365, lookback=10, sma_period=50, max_distan
     return df_results
 
 def main():
+    # Initialize database
+    init_db()
+    
     st.title("📈 NSE Pocket Pivot Screener")
-    st.markdown("Adjust filters and select conditions to screen for pocket pivot signals in Indian stocks. Results update in real-time.")
+    st.markdown("Adjust filters and select conditions to screen for pocket pivot signals in Indian stocks. Results update in real-time. Data is cached locally to speed up runs.")
 
     # Sidebar for filter inputs
     st.sidebar.header("Filter Settings")
-    max_symbols = st.sidebar.slider("Max Stocks to Scan", 50, 2000, 500, help="Limit for speed (500 takes ~3-5 mins)")
+    max_symbols = st.sidebar.slider("Max Stocks to Scan", 50, 2000, 500, help="Limit for speed (500 takes ~3-5 mins for first run, faster with cache)")
     days_back = st.sidebar.slider("Data Period (days)", 252, 730, 365, help="Historical data for analysis")
     lookback = st.sidebar.slider("Volume Lookback (days)", 5, 20, 10, help="Days to check for avg volume")
     sma_period = st.sidebar.slider("SMA Period (days)", 20, 100, 50, help="Period for 50-day SMA")
@@ -208,7 +266,7 @@ def main():
         if df_results.empty:
             st.warning("No pocket pivot signals found. Try relaxing filters or increasing max stocks.")
             if len(nse_symbols) <= 5:
-                st.error("Only sample list used. Ensure EQUITY_L.csv is in Downloads folder.")
+                st.error("Only sample list used. Ensure EQUITY_L.csv is accessible at the GitHub URL.")
         else:
             # Display results
             st.subheader("Pocket Pivot Signals")
@@ -228,8 +286,9 @@ def main():
     with st.expander("How to Use & Notes"):
         st.markdown("""
         - Adjust filters and select conditions in the sidebar, then click "Run Screener" to see results.
-        - **Runtime**: ~3-5 mins for 500 stocks. Set `Max Stocks to Scan` to 100 for ~30-60 secs.
-        - **EQUITY_L.csv**: Ensure it's in your Downloads folder (download from nseindia.com).
+        - **Runtime**: ~3-5 mins for 500 stocks on first run; subsequent runs are faster with cached data (~30-60 secs).
+        - **EQUITY_L.csv**: Fetched from GitHub (https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv).
+        - **Data Caching**: Stock data (close, high, low, volume) is cached in `stock_data.db` to reduce yfinance calls.
         - **Filters**:
           - Core: Price > previous close, volume > avg volume in lookback (if enabled), price > 50-day SMA (if enabled).
           - Custom: Price > 200-day SMA, 10-day high/low ≤ tightness %, price within max distance of 52W high and ≥ 7% below, price > lookback low * multiplier (all toggleable).
