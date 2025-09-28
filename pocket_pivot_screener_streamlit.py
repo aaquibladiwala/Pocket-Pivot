@@ -17,6 +17,28 @@ logging.basicConfig(filename='errors.log', level=logging.WARNING,
 # SQLite database setup
 DB_NAME = "stock_data.db"
 
+# Placeholder for NSE holidays (update with actual 2025 holidays if available)
+NSE_HOLIDAYS_2025 = [
+    # Example: '2025-01-26', '2025-08-15', '2025-10-02'  # Republic Day, Independence Day, Gandhi Jayanti
+]
+
+def is_trading_day(date):
+    """Check if a date is a trading day (Monday to Friday, not a holiday)."""
+    # Weekend check (Saturday=5, Sunday=6)
+    if date.weekday() >= 5:
+        return False
+    # Holiday check (optional, populate NSE_HOLIDAYS_2025)
+    if date.strftime('%Y-%m-%d') in NSE_HOLIDAYS_2025:
+        return False
+    return True
+
+def get_latest_trading_day(current_date):
+    """Get the most recent trading day before or on the current date."""
+    date = current_date
+    while not is_trading_day(date):
+        date -= timedelta(days=1)
+    return date
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -76,7 +98,10 @@ def fetch_stock_data(symbol, days_back):
         cached_data = fetch_cached_data(symbol, days_back)
         latest_date = cached_data.index.max() if not cached_data.empty else None
         end_date = datetime.now()
-        needs_update = not cached_data.empty and latest_date < end_date - timedelta(days=1)
+        latest_trading_day = get_latest_trading_day(end_date).date()
+        
+        # Only fetch from yfinance if cache is empty or doesn't include the latest trading day
+        needs_update = not cached_data.empty and latest_date.date() < latest_trading_day
         
         if cached_data.empty or needs_update:
             ticker = yf.Ticker(symbol + '.NS')
@@ -288,7 +313,7 @@ def main():
         - Adjust filters and select conditions in the sidebar, then click "Run Screener" to see results.
         - **Runtime**: ~3-5 mins for 500 stocks on first run; subsequent runs are faster with cached data (~30-60 secs).
         - **EQUITY_L.csv**: Fetched from GitHub (https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv).
-        - **Data Caching**: Stock data (close, high, low, volume) is cached in `stock_data.db` to reduce yfinance calls.
+        - **Data Caching**: Stock data (close, high, low, volume) is cached in `stock_data.db` to reduce yfinance calls. Weekend-aware caching avoids fetches on non-trading days.
         - **Filters**:
           - Core: Price > previous close, volume > avg volume in lookback (if enabled), price > 50-day SMA (if enabled).
           - Custom: Price > 200-day SMA, 10-day high/low ≤ tightness %, price within max distance of 52W high and ≥ 7% below, price > lookback low * multiplier (all toggleable).
