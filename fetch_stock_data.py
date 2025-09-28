@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import logging
+import argparse
 
 # Set up logging
 logging.basicConfig(filename='fetch_errors.log', level=logging.WARNING, 
@@ -24,6 +25,13 @@ def is_trading_day(date):
         return False
     return True
 
+def get_latest_trading_day(current_date):
+    """Get the most recent trading day before or on the current date."""
+    date = current_date
+    while not is_trading_day(date):
+        date -= timedelta(days=1)
+    return date
+
 def fetch_nse_symbols(max_symbols=None):
     try:
         df = pd.read_csv('https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv')
@@ -37,10 +45,16 @@ def fetch_nse_symbols(max_symbols=None):
         print(f"Error reading EQUITY_L.csv: {e}. Using sample list.")
         return ['RELIANCE', 'INFY', 'TCS', 'HDFCBANK', 'ICICIBANK']
 
-def fetch_stock_data(symbols, days_back):
+def fetch_stock_data(symbols, days_back, end_date=None):
     try:
+        # Set end date to latest trading day if not specified
+        if end_date is None:
+            end_date = get_latest_trading_day(datetime.now())
+        start_date = end_date - timedelta(days=days_back)
+        
         tickers = [s + '.NS' for s in symbols]
-        data = yf.download(tickers, period=f"{days_back}d", group_by='ticker', threads=True)
+        data = yf.download(tickers, start=start_date.strftime('%Y-%m-%d'), 
+                         end=end_date.strftime('%Y-%m-%d'), group_by='ticker', threads=True)
         if data is None or data.empty:
             raise ValueError("No data returned from yfinance.")
         
@@ -67,10 +81,15 @@ def fetch_stock_data(symbols, days_back):
         return pd.DataFrame()
 
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Fetch stock data and save to CSV.")
+    parser.add_argument('--force', action='store_true', help="Force data fetch even on non-trading days")
+    args = parser.parse_args()
+    
     # Check if today is a trading day
     today = datetime.now()
-    if not is_trading_day(today):
-        print("Today is not a trading day. Skipping data fetch.")
+    if not args.force and not is_trading_day(today):
+        print("Today is not a trading day. Skipping data fetch. Use --force to override.")
         exit(0)
     
     # Fetch symbols and data
