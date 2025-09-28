@@ -4,7 +4,7 @@ import pandas as pd
 import sqlite3
 from tqdm import tqdm
 import logging
-from tabulate import tabulate
+from tabulate import tabulate # Not used in final output but kept
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 from datetime import datetime, timedelta
@@ -22,12 +22,11 @@ NSE_HOLIDAYS_2025 = [
     # Example: '2025-01-26', '2025-08-15', '2025-10-02'  # Republic Day, Independence Day, Gandhi Jayanti
 ]
 
+# --- Existing Helper Functions (omitted for brevity) ---
 def is_trading_day(date):
     """Check if a date is a trading day (Monday to Friday, not a holiday)."""
-    # Weekend check (Saturday=5, Sunday=6)
     if date.weekday() >= 5:
         return False
-    # Holiday check (optional, populate NSE_HOLIDAYS_2025)
     if date.strftime('%Y-%m-%d') in NSE_HOLIDAYS_2025:
         return False
     return True
@@ -42,11 +41,9 @@ def get_latest_trading_day(current_date):
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    # Create table with last_updated column
     c.execute('''CREATE TABLE IF NOT EXISTS stock_data
-                 (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, last_updated TEXT,
-                  PRIMARY KEY (symbol, date))''')
-    # Add last_updated column to existing table if missing
+                (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, last_updated TEXT,
+                 PRIMARY KEY (symbol, date))''')
     try:
         c.execute("ALTER TABLE stock_data ADD COLUMN last_updated TEXT")
     except sqlite3.OperationalError:
@@ -55,7 +52,6 @@ def init_db():
     conn.close()
 
 def get_db_last_updated():
-    """Get the most recent last_updated timestamp from stock_data."""
     try:
         conn = sqlite3.connect(DB_NAME)
         query = "SELECT MAX(last_updated) AS last_updated FROM stock_data"
@@ -109,21 +105,32 @@ def save_to_cache(symbol, data):
     data = data[['symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'last_updated']]
     data.columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'last_updated']
     data['date'] = data['date'].astype(str)
-    data.to_sql('stock_data', conn, if_exists='append', index=False, method='multi')
-    conn.execute("DELETE FROM stock_data WHERE rowid NOT IN (SELECT MIN(rowid) FROM stock_data GROUP BY symbol, date)")
-    conn.commit()
-    conn.close()
+    
+    # Use INSERT OR REPLACE for efficiency (replaces old insert/delete logic)
+    def insert_or_replace(conn, table, data_frame):
+        cols = ', '.join(list(data_frame.columns))
+        placeholders = ', '.join(['?'] * len(data_frame.columns))
+        sql = f'INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})'
+        c = conn.cursor()
+        for row in data_frame.itertuples(index=False):
+            c.execute(sql, row)
+        conn.commit()
+
+    try:
+        insert_or_replace(conn, 'stock_data', data)
+    except Exception as e:
+        logging.warning(f"Error during INSERT OR REPLACE for {symbol}: {e}")
+    finally:
+        conn.close()
 
 def fetch_stock_data(symbol, days_back):
     try:
-        # Check cache first
         cached_data = fetch_cached_data(symbol, days_back)
         latest_date = cached_data.index.max() if not cached_data.empty else None
         end_date = datetime.now()
         latest_trading_day = get_latest_trading_day(end_date).date()
         
-        # Only fetch from yfinance if cache is empty or doesn't include the latest trading day
-        needs_update = not cached_data.empty and latest_date.date() < latest_trading_day
+        needs_update = not cached_data.empty and (latest_date.date() < latest_trading_day if latest_date else True)
         
         if cached_data.empty or needs_update:
             ticker = yf.Ticker(symbol + '.NS')
@@ -141,46 +148,34 @@ def detect_pocket_pivot(df, symbol, lookback=10, sma_period=50, max_distance_52w
                         use_sma50=True, use_sma200=True, use_volume_surge=True, use_tightness=True,
                         use_52w_high=True, use_price_above_low=True):
     try:
-        # Calculate SMAs
         df['SMA50'] = df['Close'].rolling(sma_period).mean()
         df['SMA10'] = df['Close'].rolling(10).mean()
         df['SMA200'] = df['Close'].rolling(200).mean()
         
-        # Identify down days (close < previous close)
-        df['DownDay'] = df['Close'] < df['Close'].shift(1)
-        
-        # Latest data and lookback
         latest = df.iloc[-1]
         prev = df.iloc[-2]
         lookback_data = df.iloc[-lookback-1:-1]
         
-        # Skip if insufficient data or low liquidity
         if pd.isna(latest['SMA50']) or pd.isna(latest['SMA200']) or len(lookback_data) < lookback or latest['Volume'] < min_volume:
             return None
         
-        # Pocket pivot conditions
         price_up = latest['Close'] > prev['Close']
         above_sma50 = latest['Close'] > latest['SMA50'] if use_sma50 else True
         above_sma200 = latest['Close'] > latest['SMA200'] if use_sma200 else True
         near_sma10 = abs(latest['Close'] - latest['SMA10']) / latest['Close'] < 0.02
         
-        # Volume: Compare to average volume in lookback
         volume_condition = latest['Volume'] > lookback_data['Volume'].mean() if use_volume_surge and not lookback_data.empty else True
         
-        # Tightness: High/low range <= tightness_percentage
         max_high = lookback_data['High'].max()
         min_low = lookback_data['Low'].min()
         tightness_condition = (max_high / min_low) <= (1 + tightness_percentage / 100) if use_tightness and min_low > 0 else True
         
-        # 52-week high: Price within max_distance_52w_high and not below 7% from high
         max_52w_high = df['High'].rolling(252).max().iloc[-1]
         high_distance_condition = (0.93 <= latest['Close'] / max_52w_high <= (1.0 + max_distance_52w_high)) if use_52w_high and max_52w_high > 0 else True
         
-        # Price > lookback low * price_above_low_multiplier
         min_10d_low = lookback_data['Low'].min()
         price_above_low_condition = latest['Close'] > min_10d_low * price_above_low_multiplier if use_price_above_low and min_10d_low > 0 else True
         
-        # Only return results for pocket pivot signals with all conditions
         if (price_up and above_sma50 and above_sma200 and volume_condition and 
             tightness_condition and high_distance_condition and price_above_low_condition):
             signal = "Pocket Pivot"
@@ -212,57 +207,71 @@ def fetch_market_cap(symbol):
 
 @st.cache_data
 def screen_stocks(symbols, days_back=365, lookback=10, sma_period=50, max_distance_52w_high=0.05, 
-                 tightness_percentage=5.0, min_volume=10000, price_above_low_multiplier=1.10,
-                 use_sma50=True, use_sma200=True, use_volume_surge=True, use_tightness=True,
-                 use_52w_high=True, use_price_above_low=True):
-    results = []
+                  tightness_percentage=5.0, min_volume=10000, price_above_low_multiplier=1.10,
+                  use_sma50=True, use_sma200=True, use_volume_surge=True, use_tightness=True,
+                  use_52w_high=True, use_price_above_low=True):
     
-    # Batch fetch data for all symbols
+    results = []
+    analysis_futures = []
+
+    # Attempt Batch Fetch
     st.write("Fetching data for all stocks in batch...")
     try:
         tickers = [s + '.NS' for s in symbols]
-        data = yf.download(tickers, period=f"{days_back}d", group_by='ticker', threads=True)
+        data_all = yf.download(tickers, period=f"{days_back}d", group_by='ticker', threads=True)
     except Exception as e:
         logging.warning(f"Batch download failed: {e}. Falling back to individual fetches.")
-        data = None
+        data_all = None
     
     # Process stocks in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        if data is not None and not data.empty:
-            # Use batched data
-            for symbol in tqdm(symbols, desc="Processing stocks"):
+        if data_all is not None and not data_all.empty:
+            # STAGE 1: Process Batch Data
+            for symbol in tqdm(symbols, desc="Processing stocks (Batch Download)"):
                 try:
-                    if (symbol + '.NS') in data:
-                        stock_data = data[symbol + '.NS'].dropna()
-                        stock_data['Symbol'] = symbol
-                        save_to_cache(symbol, stock_data)  # Cache batched data
-                        futures.append(executor.submit(detect_pocket_pivot, stock_data, symbol, 
-                                                    lookback, sma_period, max_distance_52w_high, 
-                                                    tightness_percentage, min_volume, price_above_low_multiplier,
-                                                    use_sma50, use_sma200, use_volume_surge, use_tightness,
-                                                    use_52w_high, use_price_above_low))
+                    ticker_key = symbol + '.NS'
+                    stock_data = data_all[ticker_key].dropna()
+                    
+                    if not stock_data.empty:
+                        # Normalize columns (yf.download returns multi-level for multi-ticker)
+                        stock_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close'] 
+                        stock_data = stock_data[['Open', 'High', 'Low', 'Close', 'Volume']]
+                        
+                        save_to_cache(symbol, stock_data)
+                        
+                        analysis_futures.append(executor.submit(detect_pocket_pivot, stock_data.copy(), symbol, 
+                                                                lookback, sma_period, max_distance_52w_high, 
+                                                                tightness_percentage, min_volume, price_above_low_multiplier,
+                                                                use_sma50, use_sma200, use_volume_surge, use_tightness,
+                                                                use_52w_high, use_price_above_low))
                 except Exception as e:
                     logging.warning(f"Error accessing batch data for {symbol}: {e}")
         else:
-            # Fallback to individual fetches with caching
-            futures = [executor.submit(fetch_stock_data, symbol, days_back) for symbol in symbols]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching stocks"):
+            # STAGE 1: Fallback to Individual Fetches
+            st.write("Falling back to individual fetches...")
+            fetch_futures = [executor.submit(fetch_stock_data, symbol, days_back) for symbol in symbols]
+            
+            data_to_analyze = []
+            for future in tqdm(as_completed(fetch_futures), total=len(fetch_futures), desc="Fetching stocks (Individual)"):
                 symbol, stock_data = future.result()
                 if stock_data is not None and not stock_data.empty:
-                    stock_data['Symbol'] = symbol
-                    futures.append(executor.submit(detect_pocket_pivot, stock_data, symbol, 
+                    data_to_analyze.append((symbol, stock_data))
+
+            # STAGE 2: Submit Analysis Tasks
+            st.write("Submitting analysis tasks...")
+            analysis_futures = [executor.submit(detect_pocket_pivot, stock_data.copy(), symbol, 
                                                 lookback, sma_period, max_distance_52w_high, 
                                                 tightness_percentage, min_volume, price_above_low_multiplier,
                                                 use_sma50, use_sma200, use_volume_surge, use_tightness,
-                                                use_52w_high, use_price_above_low))
+                                                use_52w_high, use_price_above_low) 
+                                for symbol, stock_data in data_to_analyze]
         
-        # Collect results
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Analyzing stocks"):
+        # STAGE 3: Collect Analysis Results
+        for future in tqdm(as_completed(analysis_futures), total=len(analysis_futures), desc="Analyzing stocks"):
             result = future.result()
             if result:
                 results.append(result)
-    
+
     df_results = pd.DataFrame(results)
     
     # Fetch market cap for results
@@ -274,81 +283,144 @@ def screen_stocks(symbols, days_back=365, lookback=10, sma_period=50, max_distan
     
     return df_results
 
+# --- NEW: Function to initialize session state with default values ---
+def initialize_session_state():
+    """Initializes session state keys for persistent filters."""
+    if 'max_symbols' not in st.session_state:
+        st.session_state.max_symbols = 500
+    if 'days_back' not in st.session_state:
+        st.session_state.days_back = 365
+    if 'lookback' not in st.session_state:
+        st.session_state.lookback = 10
+    if 'sma_period' not in st.session_state:
+        st.session_state.sma_period = 50
+    if 'max_distance_52w_high_percent' not in st.session_state:
+        st.session_state.max_distance_52w_high_percent = 5.0
+    if 'tightness_percentage' not in st.session_state:
+        st.session_state.tightness_percentage = 5.0
+    if 'min_volume' not in st.session_state:
+        st.session_state.min_volume = 10000
+    if 'price_above_low_multiplier' not in st.session_state:
+        st.session_state.price_above_low_multiplier = 1.10
+    if 'use_sma50' not in st.session_state:
+        st.session_state.use_sma50 = True
+    if 'use_sma200' not in st.session_state:
+        st.session_state.use_sma200 = True
+    if 'use_volume_surge' not in st.session_state:
+        st.session_state.use_volume_surge = True
+    if 'use_tightness' not in st.session_state:
+        st.session_state.use_tightness = True
+    if 'use_52w_high' not in st.session_state:
+        st.session_state.use_52w_high = True
+    if 'use_price_above_low' not in st.session_state:
+        st.session_state.use_price_above_low = True
+    if 'df_results' not in st.session_state:
+        st.session_state.df_results = pd.DataFrame() # Store the results dataframe
+    if 'screener_ran' not in st.session_state:
+        st.session_state.screener_ran = False
+    
+# --- REFACTORED MAIN FUNCTION ---
 def main():
-    # Initialize database
+    initialize_session_state()
     init_db()
     
     st.title("📈 NSE Pocket Pivot Screener")
-    st.markdown("Adjust filters and select conditions to screen for pocket pivot signals in Indian stocks. Results update in real-time. Data is cached locally to speed up runs.")
+    st.markdown("Adjust filters and select conditions to screen for pocket pivot signals in Indian stocks. **Screening runs automatically** when filter settings change.")
 
-    # Display last updated timestamp
     st.write(f"**Database Last Updated**: {get_db_last_updated()}")
 
-    # Sidebar for filter inputs
+    # Sidebar for filter inputs, using key to sync with session_state
     st.sidebar.header("Filter Settings")
-    max_symbols = st.sidebar.slider("Max Stocks to Scan", 50, 2000, 500, help="Limit for speed (500 takes ~3-5 mins for first run, faster with cache)")
-    days_back = st.sidebar.slider("Data Period (days)", 252, 730, 365, help="Historical data for analysis")
-    lookback = st.sidebar.slider("Volume Lookback (days)", 5, 20, 10, help="Days to check for avg volume")
-    sma_period = st.sidebar.slider("SMA Period (days)", 20, 100, 50, help="Period for 50-day SMA")
-    max_distance_52w_high = st.sidebar.slider("Max Distance from 52W High (%)", 1.0, 10.0, 5.0, step=0.1, help="Price within X% of 52-week high") / 100
-    tightness_percentage = st.sidebar.slider("10-Day Tightness (%)", 1.0, 10.0, 5.0, step=0.1, help="Max high/low range over 10 days")
-    min_volume = st.sidebar.number_input("Min Volume", 1000, 100000, 10000, help="Minimum daily volume")
-    price_above_low_multiplier = st.sidebar.slider("Price Above 10-Day Low Multiplier", 1.0, 1.5, 1.10, step=0.01, help="Price > X * 10-day low")
+    
+    # Run Screener Button (optional, can be used to manually force a run)
+    manual_run = st.sidebar.button("Force Run Screener")
+    
+    st.session_state.max_symbols = st.sidebar.slider("Max Stocks to Scan", 50, 2000, st.session_state.max_symbols, 
+                                                    key='max_symbols', help="Limit for speed (500 takes ~3-5 mins for first run, faster with cache)")
+    st.session_state.days_back = st.sidebar.slider("Data Period (days)", 252, 730, st.session_state.days_back, 
+                                                  key='days_back', help="Historical data for analysis")
+    st.session_state.lookback = st.sidebar.slider("Volume Lookback (days)", 5, 20, st.session_state.lookback, 
+                                                 key='lookback', help="Days to check for avg volume")
+    st.session_state.sma_period = st.sidebar.slider("SMA Period (days)", 20, 100, st.session_state.sma_period, 
+                                                   key='sma_period', help="Period for 50-day SMA")
+    st.session_state.max_distance_52w_high_percent = st.sidebar.slider("Max Distance from 52W High (%)", 1.0, 10.0, st.session_state.max_distance_52w_high_percent, step=0.1, 
+                                                                    key='max_distance_52w_high_percent', help="Price within X% of 52-week high")
+    st.session_state.tightness_percentage = st.sidebar.slider("10-Day Tightness (%)", 1.0, 10.0, st.session_state.tightness_percentage, step=0.1, 
+                                                             key='tightness_percentage', help="Max high/low range over 10 days")
+    st.session_state.min_volume = st.sidebar.number_input("Min Volume", 1000, 100000, st.session_state.min_volume, 
+                                                          key='min_volume', help="Minimum daily volume")
+    st.session_state.price_above_low_multiplier = st.sidebar.slider("Price Above 10-Day Low Multiplier", 1.0, 1.5, st.session_state.price_above_low_multiplier, step=0.01, 
+                                                                    key='price_above_low_multiplier', help="Price > X * 10-day low")
 
-    # Sidebar for condition toggles
+    # Sidebar for condition toggles, using key to sync with session_state
     st.sidebar.header("Select Conditions")
-    use_sma50 = st.sidebar.checkbox("Price > 50-day SMA", value=True)
-    use_sma200 = st.sidebar.checkbox("Price > 200-day SMA", value=True)
-    use_volume_surge = st.sidebar.checkbox("Volume > Avg Volume in Lookback", value=True)
-    use_tightness = st.sidebar.checkbox("10-Day Tightness", value=True)
-    use_52w_high = st.sidebar.checkbox("Near 52-Week High", value=True)
-    use_price_above_low = st.sidebar.checkbox("Price > Lookback Low * Multiplier", value=True)
+    st.session_state.use_sma50 = st.sidebar.checkbox("Price > 50-day SMA", value=st.session_state.use_sma50, key='use_sma50')
+    st.session_state.use_sma200 = st.sidebar.checkbox("Price > 200-day SMA", value=st.session_state.use_sma200, key='use_sma200')
+    st.session_state.use_volume_surge = st.sidebar.checkbox("Volume > Avg Volume in Lookback", value=st.session_state.use_volume_surge, key='use_volume_surge')
+    st.session_state.use_tightness = st.sidebar.checkbox("10-Day Tightness", value=st.session_state.use_tightness, key='use_tightness')
+    st.session_state.use_52w_high = st.sidebar.checkbox("Near 52-Week High", value=st.session_state.use_52w_high, key='use_52w_high')
+    st.session_state.use_price_above_low = st.sidebar.checkbox("Price > Lookback Low * Multiplier", value=st.session_state.use_price_above_low, key='use_price_above_low')
 
-    # Run screener on button click
-    if st.sidebar.button("Run Screener"):
-        with st.spinner("Screening stocks..."):
-            nse_symbols = fetch_nse_symbols(max_symbols=max_symbols)
-            df_results = screen_stocks(nse_symbols, days_back, lookback, sma_period, max_distance_52w_high, 
-                                     tightness_percentage, min_volume, price_above_low_multiplier,
-                                     use_sma50, use_sma200, use_volume_surge, use_tightness,
-                                     use_52w_high, use_price_above_low)
+    
+    # --- AUTO-RUN LOGIC ---
+    # The cache automatically detects changes in the function arguments, 
+    # and Streamlit reruns the app when a widget value changes.
+    if not st.session_state.screener_ran or manual_run:
         
-        if df_results.empty:
-            st.warning("No pocket pivot signals found. Try relaxing filters or increasing max stocks.")
-            if len(nse_symbols) <= 5:
-                st.error("Only sample list used. Ensure EQUITY_L.csv is accessible at the GitHub URL.")
-        else:
-            # Display results
-            st.subheader("Pocket Pivot Signals")
-            st.dataframe(df_results[['Symbol', 'Price', 'SMA50', 'SMA200', 'Market Cap', 'Volume', 'Signal', 
-                                    'Near 10-day SMA', '52W High Distance (%)', '10D Tightness (%)']], 
-                         use_container_width=True)
-            
-            # Download CSV
-            csv = df_results.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Results as CSV", csv, "pocket_pivot_results.csv", "text/csv")
-            
-            # Summary
-            st.metric("Total Pocket Pivot Signals", len(df_results))
-            st.write(f"Scan completed on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            # Update last updated timestamp after scan
-            st.write(f"**Database Last Updated**: {get_db_last_updated()}")
+        # Convert percentage slider value to decimal for the function
+        max_dist_decimal = st.session_state.max_distance_52w_high_percent / 100.0
+
+        with st.spinner(f"Screening {st.session_state.max_symbols} stocks..."):
+            nse_symbols = fetch_nse_symbols(max_symbols=st.session_state.max_symbols)
+            df_results = screen_stocks(
+                symbols=nse_symbols,
+                days_back=st.session_state.days_back,
+                lookback=st.session_state.lookback,
+                sma_period=st.session_state.sma_period,
+                max_distance_52w_high=max_dist_decimal, 
+                tightness_percentage=st.session_state.tightness_percentage,
+                min_volume=st.session_state.min_volume,
+                price_above_low_multiplier=st.session_state.price_above_low_multiplier,
+                use_sma50=st.session_state.use_sma50,
+                use_sma200=st.session_state.use_sma200,
+                use_volume_surge=st.session_state.use_volume_surge,
+                use_tightness=st.session_state.use_tightness,
+                use_52w_high=st.session_state.use_52w_high,
+                use_price_above_low=st.session_state.use_price_above_low
+            )
+            st.session_state.df_results = df_results
+            st.session_state.screener_ran = True
+
+    # --- DISPLAY RESULTS ---
+    df_results = st.session_state.df_results
+
+    if df_results.empty and st.session_state.screener_ran:
+        st.warning("No pocket pivot signals found. Try relaxing filters or increasing max stocks.")
+        if st.session_state.max_symbols <= 5:
+            st.error("Only sample list used. Ensure EQUITY_L.csv is accessible at the GitHub URL.")
+    elif not df_results.empty:
+        st.subheader("Pocket Pivot Signals")
+        st.dataframe(df_results[['Symbol', 'Price', 'SMA50', 'SMA200', 'Market Cap', 'Volume', 'Signal', 
+                                 'Near 10-day SMA', '52W High Distance (%)', '10D Tightness (%)']], 
+                     use_container_width=True)
+        
+        # Download CSV
+        csv = df_results.to_csv(index=False).encode('utf-8')
+        st.download_button("Download Results as CSV", csv, "pocket_pivot_results.csv", "text/csv")
+        
+        # Summary
+        st.metric("Total Pocket Pivot Signals", len(df_results))
+        st.write(f"Scan completed on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Instructions
     with st.expander("How to Use & Notes"):
         st.markdown("""
-        - Adjust filters and select conditions in the sidebar, then click "Run Screener" to see results.
+        - **Auto-Run**: The screener runs automatically whenever you adjust a filter or toggle a condition in the sidebar.
+        - **Force Run**: Use the 'Force Run Screener' button for non-filter changes (like checking for fresh data) or to re-run on startup.
         - **Runtime**: ~3-5 mins for 500 stocks on first run; subsequent runs are faster with cached data (~30-60 secs).
-        - **EQUITY_L.csv**: Fetched from GitHub (https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv).
-        - **Data Caching**: Stock data (close, high, low, volume) is cached in `stock_data.db` to reduce yfinance calls. Weekend-aware caching avoids fetches on non-trading days.
-        - **Database Last Updated**: Shows when the cache was last updated (above or after results).
         - **Filters**:
           - Core: Price > previous close, volume > avg volume in lookback (if enabled), price > 50-day SMA (if enabled).
-          - Custom: Price > 200-day SMA, 10-day high/low ≤ tightness %, price within max distance of 52W high and ≥ 7% below, price > lookback low * multiplier (all toggleable).
-          - Liquidity: Volume ≥ min volume.
-        - **Market Cap**: Displayed in results (fetched via yfinance).
-        - **Errors**: Check `errors.log` for issues (e.g., yfinance rate limits).
-        - **Deploy**: Hosted on Streamlit Community Cloud for output-only viewing.
+        - **Data Caching**: Stock data is cached in `stock_data.db`.
         """)
 
 if __name__ == "__main__":
