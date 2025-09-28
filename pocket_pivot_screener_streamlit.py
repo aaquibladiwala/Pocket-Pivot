@@ -15,7 +15,7 @@ logging.basicConfig(filename='errors.log', level=logging.WARNING,
 @st.cache_data
 def fetch_nse_symbols(max_symbols=None):
     try:
-        df = pd.read_csv('https://github.com/aaquibladiwala/Pocket-Pivot/blob/main/EQUITY_L.csv')
+        df = pd.read_csv('https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/refs/heads/main/EQUITY_L.csv')
         symbols = df['SYMBOL'].tolist()
         if max_symbols:
             symbols = symbols[:max_symbols]
