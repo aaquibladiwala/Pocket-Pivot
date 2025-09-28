@@ -42,11 +42,32 @@ def get_latest_trading_day(current_date):
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
+    # Create table with last_updated column
     c.execute('''CREATE TABLE IF NOT EXISTS stock_data
-                 (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER,
+                 (symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, last_updated TEXT,
                   PRIMARY KEY (symbol, date))''')
+    # Add last_updated column to existing table if missing
+    try:
+        c.execute("ALTER TABLE stock_data ADD COLUMN last_updated TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     conn.close()
+
+def get_db_last_updated():
+    """Get the most recent last_updated timestamp from stock_data."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        query = "SELECT MAX(last_updated) AS last_updated FROM stock_data"
+        result = pd.read_sql_query(query, conn)
+        conn.close()
+        last_updated = result['last_updated'].iloc[0]
+        if last_updated:
+            return pd.to_datetime(last_updated).strftime('%Y-%m-%d %H:%M:%S')
+        return "Database not yet initialized"
+    except Exception as e:
+        logging.warning(f"Error fetching last updated timestamp: {e}")
+        return "Database not yet initialized"
 
 @st.cache_data
 def fetch_nse_symbols(max_symbols=None):
@@ -84,8 +105,9 @@ def save_to_cache(symbol, data):
     conn = sqlite3.connect(DB_NAME)
     data = data.reset_index()
     data['symbol'] = symbol
-    data = data[['symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-    data.columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']
+    data['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    data = data[['symbol', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'last_updated']]
+    data.columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume', 'last_updated']
     data['date'] = data['date'].astype(str)
     data.to_sql('stock_data', conn, if_exists='append', index=False, method='multi')
     conn.execute("DELETE FROM stock_data WHERE rowid NOT IN (SELECT MIN(rowid) FROM stock_data GROUP BY symbol, date)")
@@ -259,6 +281,9 @@ def main():
     st.title("📈 NSE Pocket Pivot Screener")
     st.markdown("Adjust filters and select conditions to screen for pocket pivot signals in Indian stocks. Results update in real-time. Data is cached locally to speed up runs.")
 
+    # Display last updated timestamp
+    st.write(f"**Database Last Updated**: {get_db_last_updated()}")
+
     # Sidebar for filter inputs
     st.sidebar.header("Filter Settings")
     max_symbols = st.sidebar.slider("Max Stocks to Scan", 50, 2000, 500, help="Limit for speed (500 takes ~3-5 mins for first run, faster with cache)")
@@ -306,6 +331,8 @@ def main():
             # Summary
             st.metric("Total Pocket Pivot Signals", len(df_results))
             st.write(f"Scan completed on: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            # Update last updated timestamp after scan
+            st.write(f"**Database Last Updated**: {get_db_last_updated()}")
 
     # Instructions
     with st.expander("How to Use & Notes"):
@@ -314,6 +341,7 @@ def main():
         - **Runtime**: ~3-5 mins for 500 stocks on first run; subsequent runs are faster with cached data (~30-60 secs).
         - **EQUITY_L.csv**: Fetched from GitHub (https://raw.githubusercontent.com/aaquibladiwala/Pocket-Pivot/main/EQUITY_L.csv).
         - **Data Caching**: Stock data (close, high, low, volume) is cached in `stock_data.db` to reduce yfinance calls. Weekend-aware caching avoids fetches on non-trading days.
+        - **Database Last Updated**: Shows when the cache was last updated (above or after results).
         - **Filters**:
           - Core: Price > previous close, volume > avg volume in lookback (if enabled), price > 50-day SMA (if enabled).
           - Custom: Price > 200-day SMA, 10-day high/low ≤ tightness %, price within max distance of 52W high and ≥ 7% below, price > lookback low * multiplier (all toggleable).
