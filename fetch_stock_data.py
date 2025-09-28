@@ -9,8 +9,8 @@ logging.basicConfig(filename='fetch_errors.log', level=logging.WARNING,
                     format='%(asctime)s - %(message)s')
 
 # Default parameters
-MAX_SYMBOLS = 500  # Adjust as needed
-DAYS_BACK = 365    # Fetch 1 year of data
+MAX_SYMBOLS = 2500  # Adjust as needed
+DAYS_BACK = 500   # Fetch 1 year of data
 
 # Placeholder for NSE holidays (update with 2025 holidays)
 NSE_HOLIDAYS_2025 = [
