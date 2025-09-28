@@ -9,9 +9,13 @@ on:
 jobs:
   fetch-data:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Grant write access to repository contents
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -24,12 +28,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run data fetch script
-        run: python fetch_stock_data.py --force  # Add --force for initial run
+        run: python fetch_stock_data.py
 
       - name: Commit and push CSV
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          git pull origin main --rebase  # Pull remote changes before committing
           git add stock_data.csv
           git diff --staged --quiet || git commit -m "Update stock_data.csv - $(date)"
-          git push
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
